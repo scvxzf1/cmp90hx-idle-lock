@@ -222,6 +222,16 @@ static bool lock_idle_clock(nvmlDevice_t device) {
     return true;
 }
 
+static bool idle_clock_is_applied(nvmlDevice_t device) {
+    unsigned int clock = 0;
+    nvmlReturn_t result = nvmlDeviceGetClockInfo(device, NVML_CLOCK_MEM, &clock);
+    if (result != NVML_SUCCESS) {
+        log_nvml_error("read memory clock", result);
+        return false;
+    }
+    return clock == IDLE_CLOCK_MHZ;
+}
+
 static void sleep_one_sample(void) {
     struct timespec remaining = {.tv_sec = SAMPLE_SECONDS, .tv_nsec = 0};
     while (keep_running && nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
@@ -301,6 +311,13 @@ int main(int argc, char **argv) {
             }
             locked = false;
             idle_samples = 0;
+        } else if (locked && !idle_clock_is_applied(device)) {
+            fprintf(stderr, "idle memory clock was changed externally; reapplying lock\n");
+            if (!lock_idle_clock(device)) {
+                reset_clocks(device, true);
+                locked = false;
+                have_previous = false;
+            }
         } else if (!locked && idle) {
             idle_samples++;
             if (idle_samples >= IDLE_SECONDS / SAMPLE_SECONDS) {

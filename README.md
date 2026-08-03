@@ -16,6 +16,7 @@ the systemd `ExecCondition` skips the long-running process.
   process set for 60 seconds before locking memory to 405 MHz.
 - Removes the memory clock lock on activity, telemetry failure, identity
   mismatch, or clean shutdown.
+- Detects and reapplies an idle lock changed by another GPU management tool.
 - Does not open network sockets or control core clocks, power limits, or any
   other GPU.
 - Runs as root because NVIDIA restricts clock control to privileged processes.
