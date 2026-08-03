@@ -1,0 +1,26 @@
+[Unit]
+Description=CMP 90HX idle memory clock limiter
+After=multi-user.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/cmp90hx-idle-lock
+ExecCondition=/usr/local/sbin/cmp90hx-idle-lock --check
+ExecStart=/usr/local/sbin/cmp90hx-idle-lock
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
