@@ -71,6 +71,7 @@ static volatile sig_atomic_t keep_running = 1;
 static const char *target_uuid;
 static const char *target_bus_id;
 static unsigned int target_subsystem_id;
+static bool debug_logging;
 
 typedef struct {
     unsigned int gpu_util;
@@ -95,6 +96,7 @@ static bool load_target(void) {
 
     target_uuid = getenv("CMP90HX_UUID");
     target_bus_id = getenv("CMP90HX_PCI_BUS_ID");
+    debug_logging = getenv("CMP90HX_DEBUG") != NULL;
     if (target_uuid == NULL || target_uuid[0] == '\0' ||
         target_bus_id == NULL || target_bus_id[0] == '\0' ||
         subsystem == NULL || subsystem[0] == '\0') {
@@ -193,7 +195,6 @@ static bool same_idle_state(const sample_t *left, const sample_t *right) {
     return left->gpu_util == 0 && left->memory_util == 0 &&
            right->gpu_util == 0 && right->memory_util == 0 &&
            left->process_count == right->process_count &&
-           left->process_hash == right->process_hash &&
            delta <= tolerance;
 }
 
@@ -210,14 +211,7 @@ static bool lock_idle_clock(nvmlDevice_t device) {
         return false;
     }
 
-    unsigned int clock = 0;
-    result = nvmlDeviceGetClockInfo(device, NVML_CLOCK_MEM, &clock);
-    if (result != NVML_SUCCESS) {
-        log_nvml_error("read memory clock", result);
-        reset_clocks(device, true);
-        return false;
-    }
-    printf("idle lock applied; current memory clock=%u MHz\n", clock);
+    printf("idle memory clock lock requested at %u MHz\n", IDLE_CLOCK_MHZ);
     fflush(stdout);
     return true;
 }
@@ -282,8 +276,10 @@ int main(int argc, char **argv) {
 
     bool locked = false;
     unsigned int idle_samples = 0;
+    unsigned int external_clock_mismatches = 0;
     sample_t previous = {0};
     bool have_previous = false;
+    unsigned int debug_sample = 0;
 
     while (keep_running) {
         if (!verify_identity(device)) {
@@ -304,6 +300,14 @@ int main(int argc, char **argv) {
         }
 
         bool idle = have_previous && same_idle_state(&previous, &current);
+        if (debug_logging && (++debug_sample % 10u == 0u)) {
+            fprintf(stderr, "debug: util=%u/%u used=%llu processes=%u hash=%016llx idle=%s idle_samples=%u locked=%s\n",
+                    current.gpu_util, current.memory_util,
+                    current.memory_used, current.process_count,
+                    (unsigned long long)current.process_hash,
+                    idle ? "yes" : "no", idle_samples,
+                    locked ? "yes" : "no");
+        }
         if (locked && !idle) {
             if (reset_clocks(device, true)) {
                 printf("activity detected; memory clock lock removed\n");
@@ -312,12 +316,17 @@ int main(int argc, char **argv) {
             locked = false;
             idle_samples = 0;
         } else if (locked && !idle_clock_is_applied(device)) {
-            fprintf(stderr, "idle memory clock was changed externally; reapplying lock\n");
-            if (!lock_idle_clock(device)) {
-                reset_clocks(device, true);
-                locked = false;
-                have_previous = false;
+            if (++external_clock_mismatches >= 3) {
+                fprintf(stderr, "idle memory clock changed externally; reapplying lock\n");
+                if (!lock_idle_clock(device)) {
+                    reset_clocks(device, true);
+                    locked = false;
+                    have_previous = false;
+                }
+                external_clock_mismatches = 0;
             }
+        } else if (locked) {
+            external_clock_mismatches = 0;
         } else if (!locked && idle) {
             idle_samples++;
             if (idle_samples >= IDLE_SECONDS / SAMPLE_SECONDS) {
