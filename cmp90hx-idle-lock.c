@@ -64,6 +64,8 @@ extern nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t, unsigned int, unsigned 
 #define TARGET_DEVICE_ID 0x220D10DEu
 #define TARGET_MEMORY_BYTES (10240ULL * 1024ULL * 1024ULL)
 #define IDLE_CLOCK_MHZ 405u
+#define IDLE_GPU_UTIL_MAX 1u
+#define IDLE_MEMORY_UTIL_MAX 1u
 #define IDLE_SECONDS 60u
 #define SAMPLE_SECONDS 1u
 
@@ -187,13 +189,17 @@ static bool get_sample(nvmlDevice_t device, sample_t *sample) {
 }
 
 static bool same_idle_state(const sample_t *left, const sample_t *right) {
-    const unsigned long long tolerance = 16ULL * 1024ULL * 1024ULL;
+    // NVIDIA's accounting can switch between resident and aggregate VRAM
+    // figures while the GPU is idle; tolerate that bookkeeping difference.
+    const unsigned long long tolerance = 512ULL * 1024ULL * 1024ULL;
     unsigned long long delta = left->memory_used > right->memory_used
         ? left->memory_used - right->memory_used
         : right->memory_used - left->memory_used;
 
-    return left->gpu_util == 0 && left->memory_util == 0 &&
-           right->gpu_util == 0 && right->memory_util == 0 &&
+    return left->gpu_util <= IDLE_GPU_UTIL_MAX &&
+           left->memory_util <= IDLE_MEMORY_UTIL_MAX &&
+           right->gpu_util <= IDLE_GPU_UTIL_MAX &&
+           right->memory_util <= IDLE_MEMORY_UTIL_MAX &&
            left->process_count == right->process_count &&
            delta <= tolerance;
 }
@@ -277,6 +283,7 @@ int main(int argc, char **argv) {
     bool locked = false;
     unsigned int idle_samples = 0;
     unsigned int external_clock_mismatches = 0;
+    unsigned int busy_samples = 0;
     sample_t previous = {0};
     bool have_previous = false;
     unsigned int debug_sample = 0;
@@ -309,13 +316,17 @@ int main(int argc, char **argv) {
                     locked ? "yes" : "no");
         }
         if (locked && !idle) {
-            if (reset_clocks(device, true)) {
-                printf("activity detected; memory clock lock removed\n");
-                fflush(stdout);
+            if (++busy_samples >= 3u) {
+                if (reset_clocks(device, true)) {
+                    printf("activity detected; memory clock lock removed\n");
+                    fflush(stdout);
+                }
+                locked = false;
+                idle_samples = 0;
+                busy_samples = 0;
             }
-            locked = false;
-            idle_samples = 0;
         } else if (locked && !idle_clock_is_applied(device)) {
+            busy_samples = 0;
             if (++external_clock_mismatches >= 3) {
                 fprintf(stderr, "idle memory clock changed externally; reapplying lock\n");
                 if (!lock_idle_clock(device)) {
@@ -326,19 +337,23 @@ int main(int argc, char **argv) {
                 external_clock_mismatches = 0;
             }
         } else if (locked) {
+            busy_samples = 0;
             external_clock_mismatches = 0;
         } else if (!locked && idle) {
+            busy_samples = 0;
             idle_samples++;
             if (idle_samples >= IDLE_SECONDS / SAMPLE_SECONDS) {
                 sample_t confirmation = current;
                 if (verify_identity(device) && get_sample(device, &confirmation) &&
-                    same_idle_state(&current, &confirmation)) {
+                    confirmation.gpu_util <= IDLE_GPU_UTIL_MAX &&
+                    confirmation.memory_util <= IDLE_MEMORY_UTIL_MAX) {
                     locked = lock_idle_clock(device);
                 }
                 idle_samples = 0;
                 current = confirmation;
             }
         } else if (!idle) {
+            busy_samples = 0;
             idle_samples = 0;
         }
 
