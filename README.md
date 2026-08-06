@@ -4,10 +4,12 @@ A small Linux systemd daemon that lowers an NVIDIA CMP 90HX memory clock to
 405 MHz after 60 seconds of GPU inactivity and removes the clock lock as soon
 as activity returns.
 
-The installer discovers exactly one compatible CMP 90HX and pins it by UUID,
-PCI address, subsystem ID, device ID, model name, and VRAM size. The daemon
-never selects a GPU by its mutable index. If the pinned card is absent at boot,
-the systemd `ExecCondition` skips the long-running process.
+The installer checks for compatible hardware, while the daemon enumerates every
+NVML device at startup and creates an independent state machine for each CMP
+90HX it finds. Each card is pinned by its UUID, PCI address, subsystem ID,
+device ID, model name, and VRAM size. The daemon never selects a GPU by its
+mutable index. If no compatible card is present at boot, the systemd
+`ExecCondition` skips the long-running process.
 
 ## Behavior
 
@@ -17,6 +19,8 @@ the systemd `ExecCondition` skips the long-running process.
 - Removes the memory clock lock on activity, telemetry failure, identity
   mismatch, or clean shutdown.
 - Detects and reapplies an idle lock changed by another GPU management tool.
+- Supports multiple CMP 90HX cards simultaneously; one card failing identity or
+  telemetry checks does not affect the others.
 - Does not open network sockets or control core clocks, power limits, or any
   other GPU.
 - Runs as root because NVIDIA restricts clock control to privileged processes.
@@ -38,9 +42,10 @@ make
 pkexec ./install.sh
 ```
 
-The installer writes the locally discovered identifiers to the root-only file
-`/etc/default/cmp90hx-idle-lock`, installs the binary under
-`/usr/local/sbin`, and enables and starts the service.
+The installer verifies that at least one compatible CMP 90HX is present, installs
+the binary under `/usr/local/sbin`, and enables and starts the service. Device
+identifiers are discovered dynamically at every daemon start; no machine UUID
+is stored in the repository or required in a configuration file.
 
 ## Inspect
 

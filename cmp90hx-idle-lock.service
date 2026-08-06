@@ -4,7 +4,6 @@ After=multi-user.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/default/cmp90hx-idle-lock
 ExecCondition=/usr/local/sbin/cmp90hx-idle-lock --check
 ExecStart=/usr/local/sbin/cmp90hx-idle-lock
 Restart=on-failure

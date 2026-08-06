@@ -44,7 +44,8 @@ typedef struct {
 extern nvmlReturn_t nvmlInit_v2(void);
 extern nvmlReturn_t nvmlShutdown(void);
 extern const char *nvmlErrorString(nvmlReturn_t);
-extern nvmlReturn_t nvmlDeviceGetHandleByUUID(const char *, nvmlDevice_t *);
+extern nvmlReturn_t nvmlDeviceGetCount_v2(unsigned int *);
+extern nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int, nvmlDevice_t *);
 extern nvmlReturn_t nvmlDeviceGetUUID(nvmlDevice_t, char *, unsigned int);
 extern nvmlReturn_t nvmlDeviceGetName(nvmlDevice_t, char *, unsigned int);
 extern nvmlReturn_t nvmlDeviceGetPciInfo_v3(nvmlDevice_t, nvmlPciInfo_t *);
@@ -63,6 +64,7 @@ extern nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t, unsigned int, unsigned 
 #define TARGET_NAME "NVIDIA CMP 90HX"
 #define TARGET_DEVICE_ID 0x220D10DEu
 #define TARGET_MEMORY_BYTES (10240ULL * 1024ULL * 1024ULL)
+#define MAX_TARGETS 32u
 #define IDLE_CLOCK_MHZ 405u
 #define IDLE_GPU_UTIL_MAX 1u
 #define IDLE_MEMORY_UTIL_MAX 1u
@@ -70,9 +72,6 @@ extern nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t, unsigned int, unsigned 
 #define SAMPLE_SECONDS 1u
 
 static volatile sig_atomic_t keep_running = 1;
-static const char *target_uuid;
-static const char *target_bus_id;
-static unsigned int target_subsystem_id;
 static bool debug_logging;
 
 typedef struct {
@@ -83,6 +82,21 @@ typedef struct {
     unsigned int process_count;
 } sample_t;
 
+typedef struct {
+    nvmlDevice_t device;
+    char uuid[96];
+    char bus_id[32];
+    unsigned int device_id;
+    unsigned int subsystem_id;
+    bool available;
+    bool locked;
+    unsigned int idle_samples;
+    unsigned int external_clock_mismatches;
+    unsigned int busy_samples;
+    bool have_previous;
+    sample_t previous;
+} target_t;
+
 static void handle_signal(int signal_number) {
     (void)signal_number;
     keep_running = 0;
@@ -92,52 +106,81 @@ static void log_nvml_error(const char *operation, nvmlReturn_t result) {
     fprintf(stderr, "%s failed: %s (%d)\n", operation, nvmlErrorString(result), result);
 }
 
-static bool load_target(void) {
-    const char *subsystem = getenv("CMP90HX_SUBSYSTEM_ID");
-    char *end = NULL;
-
-    target_uuid = getenv("CMP90HX_UUID");
-    target_bus_id = getenv("CMP90HX_PCI_BUS_ID");
-    debug_logging = getenv("CMP90HX_DEBUG") != NULL;
-    if (target_uuid == NULL || target_uuid[0] == '\0' ||
-        target_bus_id == NULL || target_bus_id[0] == '\0' ||
-        subsystem == NULL || subsystem[0] == '\0') {
-        fprintf(stderr, "CMP90HX_UUID, CMP90HX_PCI_BUS_ID and CMP90HX_SUBSYSTEM_ID are required\n");
-        return false;
-    }
-
-    errno = 0;
-    unsigned long value = strtoul(subsystem, &end, 0);
-    if (errno != 0 || end == subsystem || *end != '\0' || value > UINT32_MAX) {
-        fprintf(stderr, "invalid CMP90HX_SUBSYSTEM_ID\n");
-        return false;
-    }
-    target_subsystem_id = (unsigned int)value;
-    return true;
-}
-
-static bool verify_identity(nvmlDevice_t device) {
-    char uuid[96] = {0};
+static bool read_identity(nvmlDevice_t device, char *uuid, size_t uuid_size,
+                          char *bus_id, size_t bus_id_size,
+                          unsigned int *device_id, unsigned int *subsystem_id,
+                          unsigned long long *memory_total) {
     char name[96] = {0};
     nvmlPciInfo_t pci = {0};
     nvmlMemory_t memory = {0};
-    nvmlReturn_t result;
 
-    result = nvmlDeviceGetUUID(device, uuid, sizeof(uuid));
-    if (result != NVML_SUCCESS) return false;
-    result = nvmlDeviceGetName(device, name, sizeof(name));
-    if (result != NVML_SUCCESS) return false;
-    result = nvmlDeviceGetPciInfo_v3(device, &pci);
-    if (result != NVML_SUCCESS) return false;
-    result = nvmlDeviceGetMemoryInfo(device, &memory);
-    if (result != NVML_SUCCESS) return false;
+    if (nvmlDeviceGetUUID(device, uuid, (unsigned int)uuid_size) != NVML_SUCCESS ||
+        nvmlDeviceGetName(device, name, sizeof(name)) != NVML_SUCCESS ||
+        nvmlDeviceGetPciInfo_v3(device, &pci) != NVML_SUCCESS ||
+        nvmlDeviceGetMemoryInfo(device, &memory) != NVML_SUCCESS) {
+        return false;
+    }
+    if (strcmp(name, TARGET_NAME) != 0 || pci.pciDeviceId != TARGET_DEVICE_ID ||
+        memory.total != TARGET_MEMORY_BYTES) {
+        return false;
+    }
 
-    return strcmp(uuid, target_uuid) == 0 &&
-           strcmp(name, TARGET_NAME) == 0 &&
-           strcmp(pci.busId, target_bus_id) == 0 &&
-           pci.pciDeviceId == TARGET_DEVICE_ID &&
-           pci.pciSubSystemId == target_subsystem_id &&
-           memory.total == TARGET_MEMORY_BYTES;
+    snprintf(bus_id, bus_id_size, "%s", pci.busId);
+    *device_id = pci.pciDeviceId;
+    *subsystem_id = pci.pciSubSystemId;
+    *memory_total = memory.total;
+    return true;
+}
+
+static unsigned int discover_targets(target_t *targets, unsigned int capacity) {
+    unsigned int count = 0;
+    unsigned int found = 0;
+    if (nvmlDeviceGetCount_v2(&count) != NVML_SUCCESS) return 0;
+
+    for (unsigned int index = 0; index < count; ++index) {
+        nvmlDevice_t device = NULL;
+        char uuid[96] = {0};
+        char bus_id[32] = {0};
+        unsigned int device_id = 0;
+        unsigned int subsystem_id = 0;
+        unsigned long long memory_total = 0;
+
+        if (nvmlDeviceGetHandleByIndex_v2(index, &device) != NVML_SUCCESS ||
+            !read_identity(device, uuid, sizeof(uuid), bus_id, sizeof(bus_id),
+                           &device_id, &subsystem_id, &memory_total)) {
+            continue;
+        }
+        if (found >= capacity) {
+            fprintf(stderr, "more than %u CMP 90HX devices found; ignoring extras\n", capacity);
+            break;
+        }
+        targets[found].device = device;
+        snprintf(targets[found].uuid, sizeof(targets[found].uuid), "%s", uuid);
+        snprintf(targets[found].bus_id, sizeof(targets[found].bus_id), "%s", bus_id);
+        targets[found].device_id = device_id;
+        targets[found].subsystem_id = subsystem_id;
+        targets[found].available = true;
+        found++;
+    }
+    return found;
+}
+
+static bool verify_identity(const target_t *target) {
+    char uuid[96] = {0};
+    char bus_id[32] = {0};
+    unsigned int device_id = 0;
+    unsigned int subsystem_id = 0;
+    unsigned long long memory_total = 0;
+
+    if (!read_identity(target->device, uuid, sizeof(uuid), bus_id, sizeof(bus_id),
+                       &device_id, &subsystem_id, &memory_total)) {
+        return false;
+    }
+    return strcmp(uuid, target->uuid) == 0 &&
+           strcmp(bus_id, target->bus_id) == 0 &&
+           device_id == target->device_id &&
+           subsystem_id == target->subsystem_id &&
+           memory_total == TARGET_MEMORY_BYTES;
 }
 
 static uint64_t mix_pid(uint64_t hash, unsigned int pid, unsigned int kind) {
@@ -172,25 +215,24 @@ static bool add_processes(nvmlDevice_t device, bool graphics, sample_t *sample) 
     return true;
 }
 
-static bool get_sample(nvmlDevice_t device, sample_t *sample) {
+static bool get_sample(const target_t *target, sample_t *sample) {
     nvmlUtilization_t utilization = {0};
     nvmlMemory_t memory = {0};
     memset(sample, 0, sizeof(*sample));
 
-    if (nvmlDeviceGetUtilizationRates(device, &utilization) != NVML_SUCCESS) return false;
-    if (nvmlDeviceGetMemoryInfo(device, &memory) != NVML_SUCCESS) return false;
-
+    if (nvmlDeviceGetUtilizationRates(target->device, &utilization) != NVML_SUCCESS ||
+        nvmlDeviceGetMemoryInfo(target->device, &memory) != NVML_SUCCESS) {
+        return false;
+    }
     sample->gpu_util = utilization.gpu;
     sample->memory_util = utilization.memory;
     sample->memory_used = memory.used;
     sample->process_hash = 1469598103934665603ULL;
-
-    return add_processes(device, false, sample) && add_processes(device, true, sample);
+    return add_processes(target->device, false, sample) &&
+           add_processes(target->device, true, sample);
 }
 
 static bool same_idle_state(const sample_t *left, const sample_t *right) {
-    // NVIDIA's accounting can switch between resident and aggregate VRAM
-    // figures while the GPU is idle; tolerate that bookkeeping difference.
     const unsigned long long tolerance = 512ULL * 1024ULL * 1024ULL;
     unsigned long long delta = left->memory_used > right->memory_used
         ? left->memory_used - right->memory_used
@@ -200,31 +242,29 @@ static bool same_idle_state(const sample_t *left, const sample_t *right) {
            left->memory_util <= IDLE_MEMORY_UTIL_MAX &&
            right->gpu_util <= IDLE_GPU_UTIL_MAX &&
            right->memory_util <= IDLE_MEMORY_UTIL_MAX &&
-           left->process_count == right->process_count &&
-           delta <= tolerance;
+           left->process_count == right->process_count && delta <= tolerance;
 }
 
-static bool reset_clocks(nvmlDevice_t device, bool report) {
-    nvmlReturn_t result = nvmlDeviceResetMemoryLockedClocks(device);
+static bool reset_clocks(target_t *target, bool report) {
+    nvmlReturn_t result = nvmlDeviceResetMemoryLockedClocks(target->device);
     if (result != NVML_SUCCESS && report) log_nvml_error("reset memory clocks", result);
     return result == NVML_SUCCESS;
 }
 
-static bool lock_idle_clock(nvmlDevice_t device) {
-    nvmlReturn_t result = nvmlDeviceSetMemoryLockedClocks(device, IDLE_CLOCK_MHZ, IDLE_CLOCK_MHZ);
+static bool lock_idle_clock(target_t *target) {
+    nvmlReturn_t result = nvmlDeviceSetMemoryLockedClocks(target->device, IDLE_CLOCK_MHZ, IDLE_CLOCK_MHZ);
     if (result != NVML_SUCCESS) {
         log_nvml_error("lock memory clocks", result);
         return false;
     }
-
-    printf("idle memory clock lock requested at %u MHz\n", IDLE_CLOCK_MHZ);
+    printf("%s: idle memory clock lock requested at %u MHz\n", target->uuid, IDLE_CLOCK_MHZ);
     fflush(stdout);
     return true;
 }
 
-static bool idle_clock_is_applied(nvmlDevice_t device) {
+static bool idle_clock_is_applied(target_t *target) {
     unsigned int clock = 0;
-    nvmlReturn_t result = nvmlDeviceGetClockInfo(device, NVML_CLOCK_MEM, &clock);
+    nvmlReturn_t result = nvmlDeviceGetClockInfo(target->device, NVML_CLOCK_MEM, &clock);
     if (result != NVML_SUCCESS) {
         log_nvml_error("read memory clock", result);
         return false;
@@ -243,7 +283,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s [--check]\n", argv[0]);
         return 2;
     }
-    if (!load_target()) return check_only ? 1 : 2;
+    debug_logging = getenv("CMP90HX_DEBUG") != NULL;
 
     nvmlReturn_t result = nvmlInit_v2();
     if (result != NVML_SUCCESS) {
@@ -251,20 +291,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    nvmlDevice_t device = NULL;
-    result = nvmlDeviceGetHandleByUUID(target_uuid, &device);
-    if (result != NVML_SUCCESS) {
-        printf("CMP 90HX target is absent; exiting without changes\n");
+    target_t targets[MAX_TARGETS] = {0};
+    unsigned int target_count = discover_targets(targets, MAX_TARGETS);
+    if (target_count == 0) {
+        printf("no compatible CMP 90HX found; exiting without changes\n");
         nvmlShutdown();
         return check_only ? 1 : 0;
     }
-    if (!verify_identity(device)) {
-        fprintf(stderr, "target UUID exists but hardware identity does not match; refusing to run\n");
-        nvmlShutdown();
-        return 3;
+    for (unsigned int i = 0; i < target_count; ++i) {
+        printf("found CMP 90HX[%u]: %s at %s\n", i, targets[i].uuid, targets[i].bus_id);
     }
-
-    printf("verified CMP 90HX: %s at %s\n", target_uuid, target_bus_id);
     fflush(stdout);
     if (check_only) {
         nvmlShutdown();
@@ -274,96 +310,90 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGHUP, handle_signal);
-
-    if (!reset_clocks(device, true)) {
-        nvmlShutdown();
-        return 4;
-    }
-
-    bool locked = false;
-    unsigned int idle_samples = 0;
-    unsigned int external_clock_mismatches = 0;
-    unsigned int busy_samples = 0;
-    sample_t previous = {0};
-    bool have_previous = false;
-    unsigned int debug_sample = 0;
+    for (unsigned int i = 0; i < target_count; ++i) reset_clocks(&targets[i], true);
 
     while (keep_running) {
-        if (!verify_identity(device)) {
-            fprintf(stderr, "GPU identity check failed; restoring clocks and exiting\n");
-            if (locked) reset_clocks(device, true);
-            break;
-        }
-
-        sample_t current;
-        if (!get_sample(device, &current)) {
-            fprintf(stderr, "GPU telemetry failed; restoring clocks\n");
-            if (locked) reset_clocks(device, true);
-            locked = false;
-            idle_samples = 0;
-            have_previous = false;
-            sleep_one_sample();
-            continue;
-        }
-
-        bool idle = have_previous && same_idle_state(&previous, &current);
-        if (debug_logging && (++debug_sample % 10u == 0u)) {
-            fprintf(stderr, "debug: util=%u/%u used=%llu processes=%u hash=%016llx idle=%s idle_samples=%u locked=%s\n",
-                    current.gpu_util, current.memory_util,
-                    current.memory_used, current.process_count,
-                    (unsigned long long)current.process_hash,
-                    idle ? "yes" : "no", idle_samples,
-                    locked ? "yes" : "no");
-        }
-        if (locked && !idle) {
-            if (++busy_samples >= 3u) {
-                if (reset_clocks(device, true)) {
-                    printf("activity detected; memory clock lock removed\n");
-                    fflush(stdout);
-                }
-                locked = false;
-                idle_samples = 0;
-                busy_samples = 0;
+        for (unsigned int i = 0; i < target_count; ++i) {
+            target_t *target = &targets[i];
+            if (!target->available) continue;
+            if (!verify_identity(target)) {
+                fprintf(stderr, "%s: identity check failed; disabling this target\n", target->uuid);
+                if (target->locked) reset_clocks(target, true);
+                target->locked = false;
+                target->available = false;
+                continue;
             }
-        } else if (locked && !idle_clock_is_applied(device)) {
-            busy_samples = 0;
-            if (++external_clock_mismatches >= 3) {
-                fprintf(stderr, "idle memory clock changed externally; reapplying lock\n");
-                if (!lock_idle_clock(device)) {
-                    reset_clocks(device, true);
-                    locked = false;
-                    have_previous = false;
-                }
-                external_clock_mismatches = 0;
-            }
-        } else if (locked) {
-            busy_samples = 0;
-            external_clock_mismatches = 0;
-        } else if (!locked && idle) {
-            busy_samples = 0;
-            idle_samples++;
-            if (idle_samples >= IDLE_SECONDS / SAMPLE_SECONDS) {
-                sample_t confirmation = current;
-                if (verify_identity(device) && get_sample(device, &confirmation) &&
-                    confirmation.gpu_util <= IDLE_GPU_UTIL_MAX &&
-                    confirmation.memory_util <= IDLE_MEMORY_UTIL_MAX) {
-                    locked = lock_idle_clock(device);
-                }
-                idle_samples = 0;
-                current = confirmation;
-            }
-        } else if (!idle) {
-            busy_samples = 0;
-            idle_samples = 0;
-        }
 
-        previous = current;
-        have_previous = true;
+            sample_t current;
+            if (!get_sample(target, &current)) {
+                fprintf(stderr, "%s: GPU telemetry failed; restoring clocks\n", target->uuid);
+                if (target->locked) reset_clocks(target, true);
+                target->locked = false;
+                target->idle_samples = 0;
+                target->busy_samples = 0;
+                target->have_previous = false;
+                continue;
+            }
+
+            bool idle = target->have_previous && same_idle_state(&target->previous, &current);
+            if (debug_logging && target->idle_samples % 10u == 0u) {
+                fprintf(stderr, "%s: debug util=%u/%u used=%llu processes=%u idle=%s locked=%s\n",
+                        target->uuid, current.gpu_util, current.memory_util,
+                        current.memory_used, current.process_count,
+                        idle ? "yes" : "no", target->locked ? "yes" : "no");
+            }
+
+            if (target->locked && !idle) {
+                if (++target->busy_samples >= 3u) {
+                    if (reset_clocks(target, true)) {
+                        printf("%s: activity detected; memory clock lock removed\n", target->uuid);
+                        fflush(stdout);
+                    }
+                    target->locked = false;
+                    target->idle_samples = 0;
+                    target->busy_samples = 0;
+                }
+            } else if (target->locked && !idle_clock_is_applied(target)) {
+                target->busy_samples = 0;
+                if (++target->external_clock_mismatches >= 3u) {
+                    fprintf(stderr, "%s: idle memory clock changed externally; reapplying lock\n", target->uuid);
+                    if (!lock_idle_clock(target)) {
+                        reset_clocks(target, true);
+                        target->locked = false;
+                    }
+                    target->external_clock_mismatches = 0;
+                }
+            } else if (target->locked) {
+                target->busy_samples = 0;
+                target->external_clock_mismatches = 0;
+            } else if (idle) {
+                target->busy_samples = 0;
+                target->idle_samples++;
+                if (target->idle_samples >= IDLE_SECONDS / SAMPLE_SECONDS) {
+                    sample_t confirmation = current;
+                    if (verify_identity(target) && get_sample(target, &confirmation) &&
+                        confirmation.gpu_util <= IDLE_GPU_UTIL_MAX &&
+                        confirmation.memory_util <= IDLE_MEMORY_UTIL_MAX) {
+                        target->locked = lock_idle_clock(target);
+                    }
+                    target->idle_samples = 0;
+                    current = confirmation;
+                }
+            } else {
+                target->busy_samples = 0;
+                target->idle_samples = 0;
+            }
+
+            target->previous = current;
+            target->have_previous = true;
+        }
         sleep_one_sample();
     }
 
-    if (locked) reset_clocks(device, true);
+    for (unsigned int i = 0; i < target_count; ++i) {
+        if (targets[i].locked) reset_clocks(&targets[i], true);
+    }
     nvmlShutdown();
-    printf("stopped; memory clock lock removed\n");
+    printf("stopped; memory clock locks removed\n");
     return 0;
 }
